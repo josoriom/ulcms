@@ -1,3 +1,4 @@
+// src/makeApi.ts
 export interface RawApi {
   utilities: {
     mean: (xs: number[]) => number;
@@ -8,36 +9,7 @@ export interface RawApi {
 
 type Fn = (ptr: number, len: number, out: number) => number;
 
-async function loadInstance(): Promise<WebAssembly.Instance> {
-  const wasmUrl = new URL("./ulcms.wasm", import.meta.url);
-  const isFile = wasmUrl.protocol === "file:";
-  if (!isFile && typeof fetch === "function") {
-    try {
-      if ("instantiateStreaming" in WebAssembly) {
-        const res = await fetch(wasmUrl);
-        if (!res.ok)
-          throw new Error(`Failed to fetch ulcms.wasm: ${res.status}`);
-        const { instance } = await WebAssembly.instantiateStreaming(res, {});
-        return instance;
-      }
-    } catch {}
-    const res = await fetch(wasmUrl);
-    if (!res.ok) throw new Error(`Failed to fetch ulcms.wasm: ${res.status}`);
-    const bytes = await res.arrayBuffer();
-    const { instance } = await WebAssembly.instantiate(bytes, {});
-    return instance;
-  } else {
-    const { readFile } = await import("fs/promises");
-    const { fileURLToPath } = await import("url");
-    const path = fileURLToPath(wasmUrl);
-    const buf = await readFile(path);
-    const { instance } = await WebAssembly.instantiate(buf, {});
-    return instance;
-  }
-}
-
-export async function loader(): Promise<RawApi> {
-  const instance = await loadInstance();
+export function makeApi(instance: WebAssembly.Instance): RawApi {
   const exp = instance.exports as Record<string, any>;
   const memory = exp.memory as WebAssembly.Memory;
   const alloc = exp.ulcms_alloc as (size: number) => number;

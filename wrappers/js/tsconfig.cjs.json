@@ -1,12 +1,10 @@
+// tsconfig.cjs.json
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-      "module": "commonjs",
-      "declaration": true,
-      "declarationMap": true
-  },
-  "exclude": [
-      "./src/**/__tests__",
-      "src/scripts",
-  ]
+    "module": "CommonJS",
+    "outDir": "lib",
+    "declaration": true,
+    "declarationMap": true
+  }
 }
