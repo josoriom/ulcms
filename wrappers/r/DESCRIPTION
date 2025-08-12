@@ -1,0 +1,9 @@
+Package: ulcms
+Type: Package
+Title: ULCMS
+Version: 0.1.0
+Authors@R: person("Javier", "Osorio", email = "javier.osorio@correounivalle.edu.co", role = c("aut","cre"))
+Description: Base-R bindings to the ULCMS native library built in Rust.
+License: MIT
+Encoding: UTF-8
+LazyData: true

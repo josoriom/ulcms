@@ -1,0 +1,38 @@
+{
+  "name": "ulcms",
+  "version": "0.1.0",
+  "description": "ULCMS: Rust core with WASM bindings (no env vars)",
+  "license": "MIT",
+  "type": "module",
+  "main": "./lib-esm/index.js",
+  "module": "./lib-esm/index.js",
+  "types": "./lib/index.d.ts",
+  "files": [
+    "lib",
+    "lib-esm",
+    "src"
+  ],
+  "scripts": {
+    "build-cheminfo": "npm run tsc && cheminfo-build --entry lib-esm/index.js --root ULCMS && cp ../../artifacts/wasm/ulcms.wasm lib/ulcms.wasm",
+    "build": "npm run tsc-esm && cp ../../artifacts/wasm/ulcms.wasm lib-esm/ulcms.wasm && cp ../../artifacts/wasm/ulcms.wasm lib/ulcms.wasm",
+    "check-types": "tsc --noEmit",
+    "clean": "rimraf dist lib types",
+    "eslint": "eslint src --cache",
+    "eslint-fix": "npm run eslint -- --fix",
+    "prepack": "npm run tsc",
+    "prettier": "prettier --check src",
+    "prettier-write": "prettier --write src",
+    "test": "npm run check-types && npm run eslint && npm run prettier && npm run test-only",
+    "test-coverage": "npm run test-only -- --coverage",
+    "test-only": "jest",
+    "tsc": "npm run clean && npm run tsc-cjs && npm run tsc-esm",
+    "tsc-cjs": "tsc --project tsconfig.cjs.json",
+    "tsc-esm": "tsc --project tsconfig.esm.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.2.1",
+    "cheminfo-build": "^1.2.1",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2"
+  }
+}
