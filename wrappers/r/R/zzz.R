@@ -1,70 +1,78 @@
+# R/zzz.R — load prebuilt shared library from inst/libs/<platform>/ and cache addresses
+
 .ulcms_state <- new.env(parent = emptyenv())
 
-.normalize_arch <- function(mach) {
-  m <- tolower(mach)
-  if (m %in% c("aarch64", "arm64")) return("arm64")
-  if (m %in% c("x86_64", "amd64"))  return("x86_64")
-  m
+.ulcms_platform <- function() {
+  sys  <- tolower(Sys.info()[["sysname"]])
+  mach <- tolower(Sys.info()[["machine"]])
+
+  # Optional override for testing:
+  plat_override <- Sys.getenv("ULCMS_PLATFORM", unset = "")
+  if (nzchar(plat_override)) return(plat_override)
+
+  if (sys == "darwin") {
+    if (mach %in% c("arm64", "aarch64")) "macos-arm64" else "macos-x86_64"
+  } else if (sys == "linux") {
+    if (mach %in% c("arm64", "aarch64")) "linux-arm64" else "linux-x86_64"
+  } else if (sys == "windows") {
+    "windows-x86_64"  # add "windows-arm64" when you ship it
+  } else {
+    stop(sprintf("Unsupported platform: %s-%s", sys, mach), call. = FALSE)
+  }
 }
 
-.os_label <- function(sys) {
-  switch(sys,
-    "Darwin"  = "macos",
-    "Linux"   = "linux",
-    "Windows" = "windows",
-    stop("Unsupported OS: ", sys)
-  )
+.ulcms_ext <- function() {
+  sys <- tolower(Sys.info()[["sysname"]])
+  if (sys == "darwin") "dylib"
+  else if (sys == "linux") "so"
+  else if (sys == "windows") "dll"
+  else stop(sprintf("Unsupported OS: %s", sys), call. = FALSE)
 }
 
-.lib_filename <- function(sys) {
-  switch(sys,
-    "Darwin"  = "libulcms.dylib",
-    "Linux"   = "libulcms.so",
-    "Windows" = "ulcms.dll",
-    stop("Unsupported OS: ", sys)
-  )
+.ulcms_lib_filename <- function() {
+  ext <- .ulcms_ext()
+  if (.Platform$OS.type == "windows") "ulcms.dll" else sprintf("libulcms.%s", ext)
 }
 
-.find_ulcms_binary <- function(pkgname) {
-  sys  <- Sys.info()[["sysname"]]
-  arch <- .normalize_arch(Sys.info()[["machine"]])
-  base <- system.file("libs", package = pkgname)
-  fname <- .lib_filename(sys)
-  label <- .os_label(sys)
-
-  cand <- file.path(base, paste0(label, "-", arch), fname)
-
-  if (!file.exists(cand)) {
-    hits <- list.files(
-      base,
-      pattern = "(^|/)ulcms\\.(dll|so)$|(^|/)libulcms\\.dylib$",
-      recursive = TRUE, full.names = TRUE, ignore.case = TRUE
-    )
-    if (length(hits)) cand <- hits[[1]]
+.ulcms_find_binary <- function(pkgname) {
+  # Optional absolute override for dev:
+  override <- Sys.getenv("ULCMS_LIB_PATH", unset = "")
+  if (nzchar(override)) {
+    if (!file.exists(override))
+      stop(sprintf("ULCMS_LIB_PATH set but file not found: %s", override), call. = FALSE)
+    return(normalizePath(override, winslash = "/", mustWork = TRUE))
   }
 
-  if (!file.exists(cand)) {
-    stop("ULCMS native library not found under: ", base,
-         "\nExpected: ", file.path(base, paste0(label, "-", arch), fname),
-         call. = FALSE)
+  plat    <- .ulcms_platform()
+  libfile <- .ulcms_lib_filename()
+  full <- system.file("libs", plat, libfile, package = pkgname)
+  if (!nzchar(full) || !file.exists(full)) {
+    stop(sprintf(
+      "Missing prebuilt native library at inst/libs/%s/%s (installed as: %s).",
+      plat, libfile, full
+    ), call. = FALSE)
   }
-  cand
+  normalizePath(full, winslash = "/", mustWork = TRUE)
 }
 
 .onLoad <- function(libname, pkgname) {
-  dll <- .find_ulcms_binary(pkgname)
-  if (.Platform$OS.type == "windows") {
-    Sys.setenv(PATH = paste(unique(c(dirname(dll),
-      strsplit(Sys.getenv("PATH"), .Platform$path.sep)[[1]])),
-      collapse = .Platform$path.sep))
-  }
-  dyn.load(dll, local = FALSE)
-  assign("dll_path", dll, envir = .ulcms_state)
+  path <- .ulcms_find_binary(pkgname)
+
+  # Keep symbols local; we’ll resolve from this DLL explicitly
+  dll <- dyn.load(path, local = TRUE, now = TRUE)
+
+  # Save DLL info for diagnostics
+  .ulcms_state$dll      <- dll
+  .ulcms_state$dll_name <- dll[["name"]]
+  .ulcms_state$libpath  <- path
+
+  # Cache function addresses (robust against symbol visibility issues)
+  .ulcms_state$addr_mean   <- getNativeSymbolInfo("ulcms_mean_f64_r",  PACKAGE = dll)$address
+  .ulcms_state$addr_std    <- getNativeSymbolInfo("ulcms_std_f64_r",   PACKAGE = dll)$address
+  .ulcms_state$addr_median <- getNativeSymbolInfo("ulcms_median_f64_r", PACKAGE = dll)$address
 }
 
 .onUnload <- function(libpath) {
-  dll <- get0("dll_path", envir = .ulcms_state, ifnotfound = NA_character_)
-  if (is.character(dll) && nzchar(dll) && file.exists(dll)) {
-    try(dyn.unload(dll), silent = TRUE)
-  }
+  p <- tryCatch(.ulcms_state$libpath, error = function(e) NULL)
+  if (!is.null(p)) try(dyn.unload(p), silent = TRUE)
 }

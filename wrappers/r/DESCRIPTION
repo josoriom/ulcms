@@ -7,3 +7,4 @@ Description: Base-R bindings to the ULCMS native library built in Rust.
 License: MIT
 Encoding: UTF-8
 LazyData: true
+SystemRequirements: Rust (cargo)
