@@ -4,10 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-crate-type = ["cdylib"]
+name = "ulcms"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "run"
+path = "src/run.rs"
 
 [profile.release]
 opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "unwind"
+
+[dependencies]
+miniz_oxide = "0.8.9"
