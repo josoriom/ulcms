@@ -1,5 +1,8 @@
 use miniz_oxide::inflate::decompress_to_vec_zlib;
-use std::{fmt, fs};
+use std::fs;
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::str;
 
 #[derive(Debug, Clone)]
 pub enum Node {
@@ -13,402 +16,6 @@ pub struct Element {
     pub name: String,
     pub attrs: Vec<(String, String)>,
     pub children: Vec<Node>,
-}
-
-impl Element {
-    pub fn attr(&self, key: &str) -> Option<&str> {
-        self.attrs
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
-    }
-    pub fn find_first(&self, name: &str) -> Option<&Element> {
-        for child in &self.children {
-            if let Node::Element(el) = child {
-                if el.name == name {
-                    return Some(el);
-                }
-                if let Some(found) = el.find_first(name) {
-                    return Some(found);
-                }
-            }
-        }
-        None
-    }
-    pub fn first_child_named(&self, name: &str) -> Option<&Element> {
-        self.children.iter().find_map(|n| match n {
-            Node::Element(e) if e.name == name => Some(e),
-            _ => None,
-        })
-    }
-    pub fn children_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Element> {
-        self.children.iter().filter_map(move |n| match n {
-            Node::Element(e) if e.name == name => Some(e),
-            _ => None,
-        })
-    }
-}
-
-impl fmt::Display for Element {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fn write_el(f: &mut fmt::Formatter<'_>, el: &Element, indent: usize) -> fmt::Result {
-            let pad = " ".repeat(indent);
-            write!(f, "{}<{}", pad, el.name)?;
-            for (k, v) in &el.attrs {
-                write!(f, " {}=\"{}\"", k, v)?;
-            }
-            writeln!(f, ">")?;
-            for child in &el.children {
-                match child {
-                    Node::Element(c) => write_el(f, c, indent + 2)?,
-                    Node::Text(t) => {
-                        let t = t.trim();
-                        if !t.is_empty() {
-                            writeln!(f, "{}  \"{}\"", pad, t)?;
-                        }
-                    }
-                    Node::Comment(c) => writeln!(f, "{}  <!--{}-->", pad, c)?,
-                }
-            }
-            writeln!(f, "{}</{}>", pad, el.name)
-        }
-        write_el(f, self, 0)
-    }
-}
-
-// <document>
-pub fn parse_mzml(path: &str) -> Result<Vec<SpectrumSummary>, String> {
-    let mut bytes = fs::read(path).map_err(|e| format!("read error: {e}"))?;
-    if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
-        bytes.drain(0..3);
-    }
-    let mut p = Parser::new(bytes);
-    let root = p.parse_document()?;
-    Ok(extract_spectra(&root))
-}
-
-struct Parser {
-    s: Vec<u8>,
-    i: usize,
-    n: usize,
-}
-
-impl Parser {
-    fn new(s: Vec<u8>) -> Self {
-        let n = s.len();
-        Self { s, i: 0, n }
-    }
-
-    // <document>
-    fn parse_document(&mut self) -> Result<Element, String> {
-        self.skip_misc()?;
-        let el = self.parse_element()?;
-        self.skip_misc()?;
-        Ok(el)
-    }
-
-    // <? ... ?> <!-- ... -->
-    fn skip_misc(&mut self) -> Result<(), String> {
-        loop {
-            self.skip_ws();
-            if self.starts_with(b"<?") {
-                self.consume_pi()?;
-            } else if self.starts_with(b"<!--") {
-                self.consume_comment()?;
-            } else {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    // <element>
-    fn parse_element(&mut self) -> Result<Element, String> {
-        self.expect(b'<')?;
-        if self.peek_is(b'/') {
-            return Err("unexpected closing tag".into());
-        }
-        let name = self.parse_name_string()?;
-        self.skip_ws();
-
-        let mut attrs = Vec::new();
-        while !self.eof() && !self.peek_is(b'>') && !self.starts_with(b"/>") {
-            let k = self.parse_name_string()?;
-            self.skip_ws();
-            self.expect(b'=')?;
-            self.skip_ws();
-            let v = self.parse_attr_value_fast()?;
-            attrs.push((k, v));
-            self.skip_ws();
-        }
-
-        if self.starts_with(b"/>") {
-            self.i += 2;
-            return Ok(Element {
-                name,
-                attrs,
-                children: Vec::new(),
-            });
-        }
-
-        self.expect(b'>')?;
-
-        let mut children = Vec::new();
-        loop {
-            self.skip_ws();
-            if self.starts_with(b"</") {
-                self.i += 2;
-                let end_name = self.parse_name_string()?;
-                self.skip_ws();
-                self.expect(b'>')?;
-                if end_name != name {
-                    return Err(format!(
-                        "mismatched end tag: expected </{}> got </{}>",
-                        name, end_name
-                    ));
-                }
-                break;
-            }
-            if self.eof() {
-                return Err("unexpected EOF inside element".into());
-            }
-            if self.peek_is(b'<') {
-                if self.starts_with(b"<!--") {
-                    let c = self.consume_comment()?;
-                    children.push(Node::Comment(c));
-                } else if self.starts_with(b"<![CDATA[") {
-                    let t = self.consume_cdata()?;
-                    if !t.trim().is_empty() {
-                        children.push(Node::Text(t));
-                    }
-                } else if self.starts_with(b"<?") {
-                    self.consume_pi()?;
-                } else {
-                    let el = self.parse_element()?;
-                    children.push(Node::Element(el));
-                }
-            } else {
-                let t = self.parse_text_fast()?;
-                if !t.is_empty() {
-                    children.push(Node::Text(t));
-                }
-            }
-        }
-        Ok(Element {
-            name,
-            attrs,
-            children,
-        })
-    }
-
-    // <text>
-    fn parse_text_fast(&mut self) -> Result<String, String> {
-        let start = self.i;
-        while !self.eof() && !self.peek_is(b'<') {
-            self.i += 1;
-        }
-        let slice = &self.s[start..self.i];
-        let s = std::str::from_utf8(slice).map_err(|_| "utf8 error")?;
-        if s.as_bytes().contains(&b'&') {
-            Ok(decode_entities(s))
-        } else {
-            Ok(s.to_string())
-        }
-    }
-
-    // <name>
-    fn parse_name_string(&mut self) -> Result<String, String> {
-        if self.eof() {
-            return Err("unexpected EOF parsing name".into());
-        }
-        let start = self.i;
-        let mut first = true;
-        while !self.eof() {
-            let c = self.s[self.i];
-            let ok = if first {
-                is_name_start(c)
-            } else {
-                is_name_char(c)
-            };
-            if !ok {
-                break;
-            }
-            self.i += 1;
-            first = false;
-        }
-        if self.i == start {
-            Err("expected name".into())
-        } else {
-            let out = std::str::from_utf8(&self.s[start..self.i]).map_err(|_| "utf8 error")?;
-            Ok(out.to_string())
-        }
-    }
-
-    // <attribute value>
-    fn parse_attr_value_fast(&mut self) -> Result<String, String> {
-        if self.eof() {
-            return Err("unexpected EOF parsing attribute value".into());
-        }
-        let quote = self.s[self.i];
-        if quote != b'"' && quote != b'\'' {
-            return Err("expected ' or \" for attribute value".into());
-        }
-        self.i += 1;
-        let start = self.i;
-        while !self.eof() && self.s[self.i] != quote {
-            self.i += 1;
-        }
-        if self.eof() {
-            return Err("unterminated attribute value".into());
-        }
-        let raw = std::str::from_utf8(&self.s[start..self.i]).map_err(|_| "utf8 error")?;
-        self.i += 1;
-        if raw.as_bytes().contains(&b'&') {
-            Ok(decode_entities(raw))
-        } else {
-            Ok(raw.to_string())
-        }
-    }
-
-    // <? ... ?>
-    fn consume_pi(&mut self) -> Result<(), String> {
-        self.expect_str(b"<?")?;
-        let mut last = 0u8;
-        while !self.eof() {
-            let c = self.next_byte().unwrap();
-            if last == b'?' && c == b'>' {
-                break;
-            }
-            last = c;
-        }
-        Ok(())
-    }
-
-    // <!-- ... -->
-    fn consume_comment(&mut self) -> Result<String, String> {
-        self.expect_str(b"<!--")?;
-        let start = self.i;
-        while !self.eof() && !self.starts_with(b"-->") {
-            self.i += 1;
-        }
-        if self.eof() {
-            return Err("unterminated comment".into());
-        }
-        let s = std::str::from_utf8(&self.s[start..self.i]).map_err(|_| "utf8 error")?;
-        self.i += 3;
-        Ok(s.to_string())
-    }
-
-    // <![CDATA[ ... ]]>
-    fn consume_cdata(&mut self) -> Result<String, String> {
-        self.expect_str(b"<![CDATA[")?;
-        let start = self.i;
-        while !self.eof() && !self.starts_with(b"]]>") {
-            self.i += 1;
-        }
-        if self.eof() {
-            return Err("unterminated CDATA".into());
-        }
-        let s = std::str::from_utf8(&self.s[start..self.i]).map_err(|_| "utf8 error")?;
-        self.i += 3;
-        Ok(s.to_string())
-    }
-
-    fn eof(&self) -> bool {
-        self.i >= self.n
-    }
-    fn peek_is(&self, b: u8) -> bool {
-        !self.eof() && self.s[self.i] == b
-    }
-    fn starts_with(&self, pat: &[u8]) -> bool {
-        let m = pat.len();
-        self.i + m <= self.n && &self.s[self.i..self.i + m] == pat
-    }
-    fn expect(&mut self, b: u8) -> Result<(), String> {
-        if self.eof() || self.s[self.i] != b {
-            return Err(format!("expected '{}'", b as char));
-        }
-        self.i += 1;
-        Ok(())
-    }
-    fn expect_str(&mut self, pat: &[u8]) -> Result<(), String> {
-        if !self.starts_with(pat) {
-            return Err(format!("expected \"{}\"", String::from_utf8_lossy(pat)));
-        }
-        self.i += pat.len();
-        Ok(())
-    }
-    fn next_byte(&mut self) -> Option<u8> {
-        if self.eof() {
-            None
-        } else {
-            let ch = self.s[self.i];
-            self.i += 1;
-            Some(ch)
-        }
-    }
-    fn skip_ws(&mut self) {
-        while !self.eof() {
-            match self.s[self.i] {
-                b' ' | b'\n' | b'\r' | b'\t' => self.i += 1,
-                _ => break,
-            }
-        }
-    }
-}
-
-fn is_name_start(c: u8) -> bool {
-    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || c == b'_' || c == b':'
-}
-fn is_name_char(c: u8) -> bool {
-    is_name_start(c) || (c >= b'0' && c <= b'9') || c == b'-' || c == b'.'
-}
-
-fn decode_entities(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut it = s.chars().peekable();
-    while let Some(c) = it.next() {
-        if c == '&' {
-            let mut ent = String::new();
-            while let Some(&nc) = it.peek() {
-                ent.push(nc);
-                it.next();
-                if nc == ';' {
-                    break;
-                }
-            }
-            let repl: String = match ent.as_str() {
-                "lt;" => "<".into(),
-                "gt;" => ">".into(),
-                "amp;" => "&".into(),
-                "apos;" => "'".into(),
-                "quot;" => "\"".into(),
-                _ => {
-                    if let Some(hex) = ent.strip_prefix("#x").and_then(|s| s.strip_suffix(';')) {
-                        u32::from_str_radix(hex, 16)
-                            .ok()
-                            .and_then(char::from_u32)
-                            .map(|ch| ch.to_string())
-                            .unwrap_or_else(|| format!("&{}", ent))
-                    } else if let Some(dec) =
-                        ent.strip_prefix('#').and_then(|s| s.strip_suffix(';'))
-                    {
-                        dec.parse::<u32>()
-                            .ok()
-                            .and_then(char::from_u32)
-                            .map(|ch| ch.to_string())
-                            .unwrap_or_else(|| format!("&{}", ent))
-                    } else {
-                        format!("&{}", ent)
-                    }
-                }
-            };
-            out.push_str(&repl);
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 #[derive(Debug, Clone)]
@@ -430,13 +37,125 @@ pub struct SpectrumSummary {
     pub intensity_array: Option<Vec<f64>>,
 }
 
-// <spectrumList><spectrum>
-fn extract_spectra(root: &Element) -> Vec<SpectrumSummary> {
+struct Scratch {
+    b64_buf: Vec<u8>,
+    zlib_buf: Vec<u8>,
+}
+
+pub fn parse_mzml(path: &str) -> Result<Vec<SpectrumSummary>, String> {
+    let file_len = fs::metadata(path).map_err(|e| format!("meta: {e}"))?.len();
+    let f = File::open(path).map_err(|e| format!("open error: {e}"))?;
+    let mut reader = BufReader::with_capacity(1 << 20, f);
+
+    let mut scratch = Scratch {
+        b64_buf: Vec::with_capacity(256),
+        zlib_buf: Vec::with_capacity(256),
+    };
+
+    if let Some(offsets) = read_spectrum_offsets(&mut reader)? {
+        if file_len <= 1_073_741_824 {
+            let mut all = Vec::with_capacity(file_len as usize);
+            reader
+                .seek(SeekFrom::Start(0))
+                .map_err(|e| format!("seek: {e}"))?;
+            reader
+                .read_to_end(&mut all)
+                .map_err(|e| format!("read: {e}"))?;
+            let mut out = Vec::with_capacity(offsets.len());
+            for i in 0..offsets.len() {
+                let start = offsets[i] as usize;
+                let end = if i + 1 < offsets.len() {
+                    offsets[i + 1] as usize
+                } else {
+                    find_spectrum_end_in(&all, start)
+                        .ok_or_else(|| "no </spectrum> after last offset".to_string())?
+                };
+                if let Some(sum) = parse_spectrum_block(&all[start..end], &mut scratch) {
+                    out.push(sum);
+                }
+            }
+            return Ok(out);
+        } else {
+            let mut out = Vec::with_capacity(offsets.len());
+            for i in 0..offsets.len() {
+                let start = offsets[i];
+                let next = if i + 1 < offsets.len() {
+                    Some(offsets[i + 1])
+                } else {
+                    None
+                };
+                if let Some(sum) = read_one_spectrum_span(&mut reader, start, next, &mut scratch)? {
+                    out.push(sum);
+                }
+            }
+            return Ok(out);
+        }
+    }
+
+    linear_scan_spectra(&mut reader, &mut scratch)
+}
+
+// <indexListOffset>, <index name="spectrum">
+fn read_spectrum_offsets<R: Read + Seek>(r: &mut R) -> Result<Option<Vec<u64>>, String> {
+    const TAIL: u64 = 64 * 1024;
+    let end = r
+        .seek(SeekFrom::End(0))
+        .map_err(|e| format!("seek end: {e}"))?;
+    let start = end.saturating_sub(TAIL);
+    r.seek(SeekFrom::Start(start))
+        .map_err(|e| format!("seek tail: {e}"))?;
+    let mut tail = Vec::with_capacity((end - start) as usize);
+    r.take(end - start)
+        .read_to_end(&mut tail)
+        .map_err(|e| format!("read tail: {e}"))?;
+    if let Some(off) = extract_index_list_offset(&tail) {
+        r.seek(SeekFrom::Start(off))
+            .map_err(|e| format!("seek indexList: {e}"))?;
+        let mut buf = vec![0u8; (end - off).min(1_000_000).max(4096) as usize];
+        let n = r
+            .read(&mut buf)
+            .map_err(|e| format!("read indexList: {e}"))?;
+        buf.truncate(n);
+        let offs = parse_spectrum_offsets_from_index(&buf);
+        return Ok(Some(offs));
+    }
+    Ok(None)
+}
+
+// <indexListOffset>
+fn extract_index_list_offset(tail: &[u8]) -> Option<u64> {
+    let tag = b"<indexListOffset>";
+    let endtag = b"</indexListOffset>";
+    let pos = memmem(tail, tag)?;
+    let pos2 = memmem(&tail[pos + tag.len()..], endtag)?;
+    let num = &tail[pos + tag.len()..pos + tag.len() + pos2];
+    parse_u64_ascii(strip_ws(num))
+}
+
+// <index name="spectrum">, <offset>
+fn parse_spectrum_offsets_from_index(buf: &[u8]) -> Vec<u64> {
     let mut out = Vec::new();
-    if let Some(list) = root.find_first("spectrumList") {
-        for spec in list.children_named("spectrum") {
-            if let Some(sum) = spectrum_summary_from_element(spec) {
-                out.push(sum);
+    if let Some(ix_start) = memmem(buf, br#"<index name="spectrum">"#) {
+        if let Some(ix_end_rel) = memmem(&buf[ix_start..], b"</index>") {
+            let block = &buf[ix_start..ix_start + ix_end_rel];
+            let mut cursor = 0usize;
+            let tag = b"<offset";
+            let endtag = b"</offset>";
+            while let Some(p) = memmem(&block[cursor..], tag) {
+                let from = cursor + p;
+                let g = match memchr(&block[from..], b'>') {
+                    Some(rel) => from + rel + 1,
+                    None => break,
+                };
+                let endp_rel = match memmem(&block[g..], endtag) {
+                    Some(v) => v,
+                    None => break,
+                };
+                let num = &block[g..g + endp_rel];
+                if let Some(v) = parse_u64_ascii(strip_ws(num)) {
+                    out.push(v);
+                }
+                cursor = g + endp_rel + endtag.len();
             }
         }
     }
@@ -444,60 +163,135 @@ fn extract_spectra(root: &Element) -> Vec<SpectrumSummary> {
 }
 
 // <spectrum>
-fn spectrum_summary_from_element(spec: &Element) -> Option<SpectrumSummary> {
-    if spec.name != "spectrum" {
-        return None;
-    }
-    let index = attr_usize(spec, "index").unwrap_or(0);
-    let id = spec.attr("id").unwrap_or("").to_string();
-    let array_length = attr_usize(spec, "defaultArrayLength").unwrap_or(0);
-
-    let mut cv = Vec::new();
-    collect_cvparams(spec, &mut cv);
-
-    let ms_level = cv_value_u32(&cv, "ms level");
-    let scan_type = if has_cv_name(&cv, "MS1 spectrum") {
-        Some("MS1".into())
-    } else if has_cv_name(&cv, "MSn spectrum") {
-        Some("MSn".into())
-    } else {
-        None
-    };
-    let polarity = if has_cv_name(&cv, "positive scan") {
-        Some("positive".into())
-    } else if has_cv_name(&cv, "negative scan") {
-        Some("negative".into())
-    } else {
-        None
-    };
-    let spectrum_type = if has_cv_name(&cv, "profile spectrum") {
-        Some("profile".into())
-    } else if has_cv_name(&cv, "centroid spectrum") {
-        Some("centroid".into())
-    } else {
-        None
-    };
-    let total_ion_current = cv_value_f64(&cv, "total ion current");
-    let base_peak_intensity = cv_value_f64(&cv, "base peak intensity");
-    let base_peak_mz = cv_value_f64(&cv, "base peak m/z");
-
-    let retention_time = cv_param_by_name(&cv, "scan start time").and_then(|p| {
-        let v = attr_f64(p, "value")?;
-        match p.attr("unitName") {
-            Some("second") => Some(v / 60.0),
-            _ => Some(v),
+fn read_one_spectrum_span<R: Read + Seek>(
+    r: &mut R,
+    start: u64,
+    next: Option<u64>,
+    _scratch: &mut Scratch,
+) -> Result<Option<SpectrumSummary>, String> {
+    r.seek(SeekFrom::Start(start))
+        .map_err(|e| format!("seek: {e}"))?;
+    if let Some(end) = next {
+        let len = (end - start) as usize;
+        let mut buf = vec![0u8; len];
+        r.read_exact(&mut buf)
+            .map_err(|e| format!("read span: {e}"))?;
+        if let Some(pos) = memmem(&buf, b"</spectrum>") {
+            buf.truncate(pos + b"</spectrum>".len());
         }
-    });
+        Ok(parse_spectrum_block(&buf, _scratch))
+    } else {
+        let mut buf = Vec::with_capacity(128 * 1024);
+        let mut tmp = [0u8; 128 * 1024];
+        let close = b"</spectrum>";
+        let mut search_from = 0usize;
+        loop {
+            let n = r
+                .read(&mut tmp)
+                .map_err(|e| format!("read tail spectrum: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            let window_start = search_from.saturating_sub(close.len().saturating_sub(1));
+            if let Some(rel) = memmem(&buf[window_start..], close) {
+                let end = window_start + rel + close.len();
+                buf.truncate(end);
+                break;
+            }
+            search_from = buf.len();
+            if buf.len() > 32 * 1024 * 1024 {
+                return Err("spectrum block too large?".into());
+            }
+        }
+        Ok(parse_spectrum_block(&buf, _scratch))
+    }
+}
 
-    let scan_window_lower_limit = cv_value_f64(&cv, "scan window lower limit");
-    let scan_window_upper_limit = cv_value_f64(&cv, "scan window upper limit");
+// </spectrum>
+fn find_spectrum_end_in(hay: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    loop {
+        let rel = memchr(&hay[i..], b'<')?;
+        let p = i + rel;
+        if hay.get(p + 1..)?.starts_with(b"/spectrum>") {
+            return Some(p + 1 + b"/spectrum>".len());
+        }
+        i = p + 1;
+    }
+}
 
-    let (mz_array, intensity_array) = decode_arrays(spec, array_length);
+// <spectrum>
+fn linear_scan_spectra<R: Read + Seek>(
+    r: &mut R,
+    scratch: &mut Scratch,
+) -> Result<Vec<SpectrumSummary>, String> {
+    r.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek: {e}"))?;
+    let mut file = Vec::new();
+    r.read_to_end(&mut file)
+        .map_err(|e| format!("read all: {e}"))?;
+    let mut out = Vec::new();
+    let mut cur = 0usize;
+    let open_tag = b"<spectrum ";
+    let close_tag = b"</spectrum>";
+    while let Some(p) = memmem(&file[cur..], open_tag) {
+        let start = cur + p;
+        let end_rel = memmem(&file[start..], close_tag)
+            .ok_or_else(|| "unterminated <spectrum>".to_string())?;
+        let end = start + end_rel + close_tag.len();
+        if let Some(sum) = parse_spectrum_block(&file[start..end], scratch) {
+            out.push(sum);
+        }
+        cur = end;
+    }
+    Ok(out)
+}
+
+// <spectrum>, <cvParam>, <binaryDataArray>, <binary>
+fn parse_spectrum_block(block: &[u8], scratch: &mut Scratch) -> Option<SpectrumSummary> {
+    let index = find_attr_usize(block, b"spectrum", b"index").unwrap_or(0);
+    let id = find_attr_string(block, b"spectrum", b"id").unwrap_or_default();
+    let array_len = find_attr_usize(block, b"spectrum", b"defaultArrayLength").unwrap_or(0);
+
+    let header_end = memmem(block, b"<binaryDataArrayList").unwrap_or(block.len());
+    let header = &block[..header_end];
+
+    let ms_level = find_cv_value_u32(header, b"ms level");
+    let scan_type = if has_cv_name(header, b"MS1 spectrum") {
+        Some("MS1".to_string())
+    } else if has_cv_name(header, b"MSn spectrum") {
+        Some("MSn".to_string())
+    } else {
+        None
+    };
+    let polarity = if has_cv_name(header, b"positive scan") {
+        Some("positive".to_string())
+    } else if has_cv_name(header, b"negative scan") {
+        Some("negative".to_string())
+    } else {
+        None
+    };
+    let spectrum_type = if has_cv_name(header, b"profile spectrum") {
+        Some("profile".to_string())
+    } else if has_cv_name(header, b"centroid spectrum") {
+        Some("centroid".to_string())
+    } else {
+        None
+    };
+    let total_ion_current = find_cv_value_f64(header, b"total ion current");
+    let base_peak_intensity = find_cv_value_f64(header, b"base peak intensity");
+    let base_peak_mz = find_cv_value_f64(header, b"base peak m/z");
+    let retention_time = find_scan_start_time_min(header);
+    let scan_window_lower_limit = find_cv_value_f64(header, b"scan window lower limit");
+    let scan_window_upper_limit = find_cv_value_f64(header, b"scan window upper limit");
+
+    let (mz_array, intensity_array) = decode_binary_arrays(block, array_len, scratch);
 
     Some(SpectrumSummary {
         index,
         id,
-        array_length,
+        array_length: array_len,
         ms_level,
         scan_type,
         polarity,
@@ -513,140 +307,395 @@ fn spectrum_summary_from_element(spec: &Element) -> Option<SpectrumSummary> {
     })
 }
 
+fn find_attr_usize(buf: &[u8], tag: &[u8], attr: &[u8]) -> Option<usize> {
+    find_attr_ascii(buf, tag, attr).and_then(|s| str::from_utf8(s).ok()?.parse().ok())
+}
+
+fn find_attr_string(buf: &[u8], tag: &[u8], attr: &[u8]) -> Option<String> {
+    let b = find_attr_ascii(buf, tag, attr)?;
+    String::from_utf8(b.to_vec()).ok()
+}
+
+fn find_attr_ascii<'a>(buf: &'a [u8], tag: &[u8], attr: &[u8]) -> Option<&'a [u8]> {
+    let mut pat = Vec::with_capacity(1 + tag.len());
+    pat.push(b'<');
+    pat.extend_from_slice(tag);
+    let start = memmem(buf, &pat)?;
+    let gt = memchr(&buf[start..], b'>').map(|x| start + x)?;
+    let head = &buf[start..gt];
+    find_attr_value_in_tag(head, attr)
+}
+
+fn find_attr_value_in_tag<'a>(head: &'a [u8], attr: &[u8]) -> Option<&'a [u8]> {
+    let mut pat = Vec::with_capacity(attr.len() + 1);
+    pat.extend_from_slice(attr);
+    pat.push(b'=');
+    let p = memmem(head, &pat)?;
+    let q = p + pat.len();
+    let quote = *head.get(q)?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let rest = &head[q + 1..];
+    let end = memchr(rest, quote)?;
+    Some(&rest[..end])
+}
+
 // <cvParam>
-fn collect_cvparams<'a>(el: &'a Element, out: &mut Vec<&'a Element>) {
-    for ch in &el.children {
-        if let Node::Element(e) = ch {
-            if e.name == "cvParam" {
-                out.push(e);
+fn has_cv_name(buf: &[u8], name: &[u8]) -> bool {
+    let mut cur = 0usize;
+    const TAG: &[u8] = b"<cvParam";
+    while let Some(p) = memmem(&buf[cur..], TAG) {
+        let from = cur + p;
+        if let Some(gt_rel) = memchr(&buf[from..], b'>') {
+            let gt = from + gt_rel;
+            let head = &buf[from..gt];
+            if let Some(v) = find_attr_value_in_tag(head, b"name") {
+                if v == name {
+                    return true;
+                }
             }
-            collect_cvparams(e, out);
+            cur = gt + 1;
+            continue;
+        } else {
+            return false;
         }
     }
+    false
 }
 
 // <cvParam>
-fn cv_param_by_name<'a>(cv: &'a [&'a Element], name: &str) -> Option<&'a Element> {
-    cv.iter().copied().find(|p| p.attr("name") == Some(name))
+fn find_cv_value_f64(buf: &[u8], name: &[u8]) -> Option<f64> {
+    find_cv_value(buf, name).and_then(|s| str::from_utf8(s).ok()?.parse().ok())
 }
 
 // <cvParam>
-fn has_cv_name(cv: &[&Element], name: &str) -> bool {
-    cv_param_by_name(cv, name).is_some()
+fn find_cv_value_u32(buf: &[u8], name: &[u8]) -> Option<u32> {
+    find_cv_value(buf, name).and_then(|s| str::from_utf8(s).ok()?.parse().ok())
 }
 
 // <cvParam>
-fn cv_value_f64(cv: &[&Element], name: &str) -> Option<f64> {
-    cv_param_by_name(cv, name).and_then(|p| attr_f64(p, "value"))
+fn find_cv_value<'a>(buf: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let mut cur = 0usize;
+    const TAG: &[u8] = b"<cvParam";
+    while let Some(p) = memmem(&buf[cur..], TAG) {
+        let from = cur + p;
+        let gt = memchr(&buf[from..], b'>').map(|x| from + x)?;
+        let head = &buf[from..gt];
+        if let Some(nm) = find_attr_value_in_tag(head, b"name") {
+            if nm == name {
+                return find_attr_value_in_tag(head, b"value");
+            }
+        }
+        cur = gt + 1;
+    }
+    None
 }
 
-// <cvParam>
-fn cv_value_u32(cv: &[&Element], name: &str) -> Option<u32> {
-    cv_param_by_name(cv, name).and_then(|p| attr_u32(p, "value"))
+// <cvParam name="scan start time">
+fn find_scan_start_time_min(buf: &[u8]) -> Option<f64> {
+    let mut cur = 0usize;
+    const SCAN_TAG: &[u8] = b"<cvParam";
+    while let Some(p) = memmem(&buf[cur..], SCAN_TAG) {
+        let from = cur + p;
+        let gt = memchr(&buf[from..], b'>').map(|x| from + x)?;
+        let head = &buf[from..gt];
+        if let Some(nm) = find_attr_value_in_tag(head, b"name") {
+            if nm == b"scan start time" {
+                let val = find_attr_value_in_tag(head, b"value")?;
+                let mut v: f64 = str::from_utf8(val).ok()?.parse().ok()?;
+                if let Some(unit) = find_attr_value_in_tag(head, b"unitName") {
+                    if unit == b"second" {
+                        v /= 60.0;
+                    }
+                }
+                return Some(v);
+            }
+        }
+        cur = gt + 1;
+    }
+    None
 }
 
-fn attr_usize(el: &Element, key: &str) -> Option<usize> {
-    el.attr(key)?.parse().ok()
-}
-fn attr_u32(el: &Element, key: &str) -> Option<u32> {
-    el.attr(key)?.parse().ok()
-}
-fn attr_f64(el: &Element, key: &str) -> Option<f64> {
-    el.attr(key)?.parse().ok()
+// <binaryDataArray>
+fn bda_flags(b: &[u8]) -> (bool, bool, bool, bool, bool, bool) {
+    let stop = memmem(b, b"<binary>").unwrap_or(b.len());
+    let head = &b[..stop];
+    let mut kind_mz = false;
+    let mut kind_int = false;
+    let mut is_zlib = false;
+    let mut is_f64 = false;
+    let mut is_f32 = false;
+    let mut little = true;
+    let mut cur = 0usize;
+    const TAG: &[u8] = b"<cvParam";
+    while let Some(p) = memmem(&head[cur..], TAG) {
+        let from = cur + p;
+        if let Some(gt_rel) = memchr(&head[from..], b'>') {
+            let gt = from + gt_rel;
+            let tag_head = &head[from..gt];
+            if let Some(nm) = find_attr_value_in_tag(tag_head, b"name") {
+                match nm {
+                    b"m/z array" => kind_mz = true,
+                    b"intensity array" => kind_int = true,
+                    b"zlib compression" => is_zlib = true,
+                    b"64-bit float" => is_f64 = true,
+                    b"32-bit float" => is_f32 = true,
+                    b"little endian" => little = true,
+                    b"big endian" => little = false,
+                    _ => {}
+                }
+            }
+            cur = gt + 1;
+        } else {
+            break;
+        }
+    }
+    (kind_mz, kind_int, is_zlib, is_f64, is_f32, little)
 }
 
-// <binaryDataArrayList><binaryDataArray><cvParam><binary>
-fn decode_arrays(spec: &Element, expected_len: usize) -> (Option<Vec<f64>>, Option<Vec<f64>>) {
-    let list = match spec.first_child_named("binaryDataArrayList") {
-        Some(x) => x,
-        None => return (None, None),
-    };
+// <binaryDataArray>, <binary>
+fn decode_binary_arrays(
+    block: &[u8],
+    expected_len: usize,
+    scratch: &mut Scratch,
+) -> (Option<Vec<f64>>, Option<Vec<f64>>) {
     let mut mz: Option<Vec<f64>> = None;
     let mut inten: Option<Vec<f64>> = None;
-
-    for bda in list.children_named("binaryDataArray") {
-        let mut kind_mz = false;
-        let mut kind_int = false;
-        let mut is_zlib = false;
-        let mut is_f64 = false;
-        let mut is_f32 = false;
-        let mut little = true;
-
-        for p in bda.children_named("cvParam") {
-            match p.attr("name") {
-                Some("m/z array") => kind_mz = true,
-                Some("intensity array") => kind_int = true,
-                Some("zlib compression") => is_zlib = true,
-                Some("64-bit float") => is_f64 = true,
-                Some("32-bit float") => is_f32 = true,
-                Some("little endian") => little = true,
-                Some("big endian") => little = false,
-                _ => {}
-            }
-        }
-
-        let bin_text = bda
-            .first_child_named("binary")
-            .and_then(|b| first_text_ref(b));
-        if bin_text.is_none() {
-            continue;
-        }
-        let bin_text = bin_text.unwrap();
-
-        let mut bytes = match decode_base64_ws(bin_text) {
-            Some(b) => b,
-            None => continue,
+    let mut cur = 0usize;
+    const BDA: &[u8] = b"<binaryDataArray";
+    while let Some(p) = memmem(&block[cur..], BDA) {
+        let start = cur + p;
+        let end_rel = match memmem(&block[start..], b"</binaryDataArray>") {
+            Some(v) => v,
+            None => break,
         };
+        let b = &block[start..start + end_rel];
 
-        if is_zlib {
-            if let Ok(d) = decompress_to_vec_zlib(&bytes) {
-                bytes = d;
-            } else {
+        let (kind_mz, kind_int, is_zlib, is_f64, is_f32, little) = bda_flags(b);
+
+        if let Some((bs, be)) = tag_body(b, b"<binary>", b"</binary>") {
+            scratch.b64_buf.clear();
+            if !decode_base64_ws_into(&b[bs..be], &mut scratch.b64_buf) {
+                cur = start + end_rel + b"</binaryDataArray>".len();
                 continue;
             }
-        }
 
-        if is_f64 {
-            let want = if expected_len > 0 {
-                expected_len
+            let bytes: &[u8] = if is_zlib {
+                scratch.zlib_buf.clear();
+                match decompress_to_vec_zlib(&scratch.b64_buf) {
+                    Ok(v) => {
+                        scratch.zlib_buf = v;
+                        &scratch.zlib_buf
+                    }
+                    Err(_) => {
+                        cur = start + end_rel + b"</binaryDataArray>".len();
+                        continue;
+                    }
+                }
             } else {
-                bytes.len() / 8
+                &scratch.b64_buf
             };
-            let vals = bytes_to_f64_exact(&bytes, little, want);
-            if kind_mz {
-                mz = Some(vals);
-            } else if kind_int {
-                inten = Some(vals);
-            }
-        } else if is_f32 {
+
             let want = if expected_len > 0 {
                 expected_len
+            } else if is_f64 {
+                bytes.len() / 8
             } else {
                 bytes.len() / 4
             };
-            let vals = bytes_to_f32_as_f64_exact(&bytes, little, want);
-            if kind_mz {
-                mz = Some(vals);
-            } else if kind_int {
-                inten = Some(vals);
+
+            let vals = if is_f64 {
+                bytes_to_f64_exact_into(bytes, little, want)
+            } else if is_f32 {
+                bytes_to_f32_as_f64_exact_into(bytes, little, want)
+            } else {
+                Vec::new()
+            };
+
+            match (kind_mz, kind_int) {
+                (true, false) => mz = Some(vals),
+                (false, true) => inten = Some(vals),
+                (true, true) => {}
+                (false, false) => {}
             }
         }
-    }
 
+        cur = start + end_rel + b"</binaryDataArray>".len();
+    }
     (mz, inten)
 }
 
 // <binary>
-fn first_text_ref<'a>(el: &'a Element) -> Option<&'a str> {
-    for ch in &el.children {
-        if let Node::Text(t) = ch {
-            let s = t.trim();
-            if !s.is_empty() {
-                return Some(s);
-            }
+fn tag_body(hay: &[u8], open: &[u8], close: &[u8]) -> Option<(usize, usize)> {
+    let s = memmem(hay, open)?;
+    let e_rel = memmem(&hay[s + open.len()..], close)?;
+    Some((s + open.len(), s + open.len() + e_rel))
+}
+
+fn decode_base64_ws_into(s: &[u8], out: &mut Vec<u8>) -> bool {
+    let mut useful = 0usize;
+    let mut pads = 0usize;
+    for &b in s.iter().rev() {
+        if is_ws(b) {
+            continue;
+        }
+        if b == b'=' {
+            pads += 1;
+        } else {
+            break;
         }
     }
+    for &b in s {
+        if !is_ws(b) {
+            useful += 1;
+        }
+    }
+    if useful == 0 {
+        return true;
+    }
+    if useful % 4 != 0 {
+        return false;
+    }
+    let estimated = useful / 4 * 3 - pads;
+    out.reserve(estimated);
+    let inv = &BASE64_INV;
+    let mut q = [0u8; 4];
+    let mut qi = 0usize;
+    for &b in s {
+        if is_ws(b) {
+            continue;
+        }
+        q[qi] = b;
+        qi += 1;
+        if qi == 4 {
+            let v0 = inv[q[0] as usize];
+            if v0 == 255 {
+                return false;
+            }
+            let v1 = inv[q[1] as usize];
+            if v1 == 255 {
+                return false;
+            }
+            let v2 = if q[2] == b'=' {
+                0
+            } else {
+                let v = inv[q[2] as usize];
+                if v == 255 {
+                    return false;
+                }
+                v
+            };
+            let v3 = if q[3] == b'=' {
+                0
+            } else {
+                let v = inv[q[3] as usize];
+                if v == 255 {
+                    return false;
+                }
+                v
+            };
+            let n = ((v0 as u32) << 18) | ((v1 as u32) << 12) | ((v2 as u32) << 6) | (v3 as u32);
+            out.push(((n >> 16) & 0xFF) as u8);
+            if q[2] != b'=' {
+                out.push(((n >> 8) & 0xFF) as u8);
+            }
+            if q[3] != b'=' {
+                out.push((n & 0xFF) as u8);
+            }
+            qi = 0;
+        }
+    }
+    qi == 0
+}
+
+#[inline]
+fn is_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\n' | b'\r' | b'\t')
+}
+
+#[inline]
+fn bytes_to_f64_exact_into(b: &[u8], little: bool, want: usize) -> Vec<f64> {
+    let len = want.min(b.len() / 8);
+    let mut out = Vec::with_capacity(len);
+    let bytes = &b[..len * 8];
+
+    if little {
+        for c in bytes.chunks_exact(8) {
+            let bits = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+            out.push(f64::from_bits(bits));
+        }
+    } else {
+        for c in bytes.chunks_exact(8) {
+            let bits = u64::from_be_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+            out.push(f64::from_bits(bits));
+        }
+    }
+    out
+}
+
+#[inline]
+fn bytes_to_f32_as_f64_exact_into(b: &[u8], little: bool, want: usize) -> Vec<f64> {
+    let len = want.min(b.len() / 4);
+    let mut out = Vec::with_capacity(len);
+    let words = &b[..len * 4];
+
+    for c in words.chunks_exact(4) {
+        let bits = if little {
+            u32::from_le_bytes([c[0], c[1], c[2], c[3]])
+        } else {
+            u32::from_be_bytes([c[0], c[1], c[2], c[3]])
+        };
+        out.push(f32::from_bits(bits) as f64);
+    }
+    out
+}
+
+fn memmem(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let first = needle[0];
+    let mut i = 0usize;
+    while let Some(rel) = memchr(&hay[i..], first) {
+        let p = i + rel;
+        if hay.get(p..p + needle.len()).map_or(false, |w| w == needle) {
+            return Some(p);
+        }
+        i = p + 1;
+    }
     None
+}
+
+fn memchr(hay: &[u8], byte: u8) -> Option<usize> {
+    hay.iter().position(|&b| b == byte)
+}
+
+fn strip_ws(s: &[u8]) -> &[u8] {
+    let mut a = 0;
+    let mut b = s.len();
+    while a < b && is_ws(s[a]) {
+        a += 1;
+    }
+    while b > a && is_ws(s[b - 1]) {
+        b -= 1;
+    }
+    &s[a..b]
+}
+
+fn parse_u64_ascii(s: &[u8]) -> Option<u64> {
+    let t = strip_ws(s);
+    if t.is_empty() {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for &c in t {
+        if c < b'0' || c > b'9' {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add((c - b'0') as u64)?;
+    }
+    Some(v)
 }
 
 const fn build_b64_inv() -> [u8; 256] {
@@ -659,143 +708,4 @@ const fn build_b64_inv() -> [u8; 256] {
     }
     t
 }
-
 static BASE64_INV: [u8; 256] = build_b64_inv();
-
-#[inline]
-fn is_b64_ws(b: u8) -> bool {
-    matches!(b, b' ' | b'\n' | b'\r' | b'\t')
-}
-
-fn decode_base64_ws(s: &str) -> Option<Vec<u8>> {
-    let bytes = s.as_bytes();
-
-    let mut useful = 0usize;
-    let mut pads = 0usize;
-    for &b in bytes.iter().rev() {
-        if is_b64_ws(b) {
-            continue;
-        }
-        if b == b'=' {
-            pads += 1;
-        } else {
-            break;
-        }
-    }
-    for &b in bytes {
-        if !is_b64_ws(b) {
-            useful += 1;
-        }
-    }
-    if useful == 0 {
-        return Some(Vec::new());
-    }
-    if useful % 4 != 0 {
-        return None;
-    }
-
-    let out_len = useful / 4 * 3 - pads;
-    let mut out = Vec::with_capacity(out_len);
-
-    let inv = &BASE64_INV;
-    let mut q = [0u8; 4];
-    let mut qi = 0usize;
-
-    for &b in bytes {
-        if is_b64_ws(b) {
-            continue;
-        }
-        q[qi] = b;
-        qi += 1;
-        if qi == 4 {
-            let b0 = q[0];
-            let b1 = q[1];
-            let b2 = q[2];
-            let b3 = q[3];
-
-            if b0 == b'=' || b1 == b'=' {
-                return None;
-            }
-            let v0 = inv[b0 as usize];
-            if v0 == 255 {
-                return None;
-            }
-            let v1 = inv[b1 as usize];
-            if v1 == 255 {
-                return None;
-            }
-
-            let v2 = if b2 == b'=' {
-                0
-            } else {
-                let v = inv[b2 as usize];
-                if v == 255 {
-                    return None;
-                }
-                v
-            };
-            let v3 = if b3 == b'=' {
-                0
-            } else {
-                let v = inv[b3 as usize];
-                if v == 255 {
-                    return None;
-                }
-                v
-            };
-
-            let n = ((v0 as u32) << 18) | ((v1 as u32) << 12) | ((v2 as u32) << 6) | (v3 as u32);
-            out.push(((n >> 16) & 0xFF) as u8);
-            if b2 != b'=' {
-                out.push(((n >> 8) & 0xFF) as u8);
-            }
-            if b3 != b'=' {
-                out.push((n & 0xFF) as u8);
-            }
-
-            qi = 0;
-        }
-    }
-    if qi != 0 {
-        return None;
-    }
-    Some(out)
-}
-
-fn bytes_to_f64_exact(b: &[u8], little: bool, want: usize) -> Vec<f64> {
-    let n = b.len() / 8;
-    let len = want.min(n);
-    let mut out = Vec::with_capacity(len);
-    let mut i = 0usize;
-    for _ in 0..len {
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(&b[i..i + 8]);
-        let v = if little {
-            f64::from_le_bytes(arr)
-        } else {
-            f64::from_be_bytes(arr)
-        };
-        out.push(v);
-        i += 8;
-    }
-    out
-}
-
-fn bytes_to_f32_as_f64_exact(b: &[u8], little: bool, want: usize) -> Vec<f64> {
-    let n = b.len() / 4;
-    let len = want.min(n);
-    let mut out = Vec::with_capacity(len);
-    let mut i = 0usize;
-    for _ in 0..len {
-        let mut arr = [0u8; 4];
-        arr.copy_from_slice(&b[i..i + 4]);
-        let v32 = if little {
-            f32::from_le_bytes(arr)
-        } else {
-            f32::from_be_bytes(arr)
-        };
-        out.push(v32 as f64);
-        i += 4;
-    }
-    out
-}
