@@ -1,7 +1,5 @@
 use miniz_oxide::inflate::decompress_to_vec_zlib;
-use std::fs;
-use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::str;
 
 #[derive(Debug, Clone)]
@@ -42,32 +40,24 @@ struct Scratch {
     zlib_buf: Vec<u8>,
 }
 
-pub fn parse_mzml(path: &str) -> Result<Vec<SpectrumSummary>, String> {
-    let file_len = fs::metadata(path).map_err(|e| format!("meta: {e}"))?.len();
-    let f = File::open(path).map_err(|e| format!("open error: {e}"))?;
-    let mut reader = BufReader::with_capacity(1 << 20, f);
-
+pub fn parse_mzml(bytes: &[u8]) -> Result<Vec<SpectrumSummary>, String> {
+    let file_len = bytes.len() as u64;
+    let mut cursor = Cursor::new(bytes);
     let mut scratch = Scratch {
         b64_buf: Vec::with_capacity(256),
         zlib_buf: Vec::with_capacity(256),
     };
 
-    if let Some(offsets) = read_spectrum_offsets(&mut reader)? {
+    if let Some(offsets) = read_spectrum_offsets(&mut cursor)? {
         if file_len <= 1_073_741_824 {
-            let mut all = Vec::with_capacity(file_len as usize);
-            reader
-                .seek(SeekFrom::Start(0))
-                .map_err(|e| format!("seek: {e}"))?;
-            reader
-                .read_to_end(&mut all)
-                .map_err(|e| format!("read: {e}"))?;
+            let all = bytes;
             let mut out = Vec::with_capacity(offsets.len());
             for i in 0..offsets.len() {
                 let start = offsets[i] as usize;
                 let end = if i + 1 < offsets.len() {
                     offsets[i + 1] as usize
                 } else {
-                    find_spectrum_end_in(&all, start)
+                    find_spectrum_end_in(all, start)
                         .ok_or_else(|| "no </spectrum> after last offset".to_string())?
                 };
                 if let Some(sum) = parse_spectrum_block(&all[start..end], &mut scratch) {
@@ -84,7 +74,7 @@ pub fn parse_mzml(path: &str) -> Result<Vec<SpectrumSummary>, String> {
                 } else {
                     None
                 };
-                if let Some(sum) = read_one_spectrum_span(&mut reader, start, next, &mut scratch)? {
+                if let Some(sum) = read_one_spectrum_span(&mut cursor, start, next, &mut scratch)? {
                     out.push(sum);
                 }
             }
@@ -92,7 +82,8 @@ pub fn parse_mzml(path: &str) -> Result<Vec<SpectrumSummary>, String> {
         }
     }
 
-    linear_scan_spectra(&mut reader, &mut scratch)
+    cursor.set_position(0);
+    linear_scan_spectra(&mut cursor, &mut scratch)
 }
 
 // <indexListOffset>, <index name="spectrum">

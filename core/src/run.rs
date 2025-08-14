@@ -1,11 +1,13 @@
+use std::fs;
 use std::time::Instant;
 use ulcms::utilities::parse_mzml::{SpectrumSummary, parse_mzml};
 
 fn main() {
     let path = "/Users/josoriom/github/josoriom/ulcms/core/data/iron_ultrairon_SER_MS-AI-RPNEG@fNMR_IROr26_IROp011_LTR_30.mzML";
 
+    let data = fs::read(path).expect("read file");
     let start = Instant::now();
-    match parse_mzml(path) {
+    match parse_mzml(&data) {
         Ok(spectra) => {
             let elapsed = start.elapsed();
             println!("Processing took: {:.3?}", elapsed);

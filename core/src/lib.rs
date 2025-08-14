@@ -1,151 +1,13 @@
-//! ULCMS: Rust core with C ABI exports (no third-party crates).
+//! ULCMS: Rust core with C ABI exports for mzML parsing.
 
-use core::ffi::{c_char, c_double, c_int};
+use core::ffi::{c_char, c_int};
 use std::ffi::{CStr, CString};
+use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub mod utilities;
 
 use utilities::parse_mzml::{SpectrumSummary, parse_mzml};
-
-#[inline]
-fn mean(xs: &[f64]) -> f64 {
-    let sum: f64 = xs.iter().copied().sum();
-    sum / (xs.len() as f64)
-}
-
-#[inline]
-fn std(xs: &[f64]) -> f64 {
-    let mu = mean(xs);
-    let mut acc = 0.0f64;
-    for &x in xs {
-        let d = x - mu;
-        acc += d * d;
-    }
-    (acc / (xs.len() as f64)).sqrt()
-}
-
-#[inline]
-fn median(xs: &[f64]) -> f64 {
-    let mut v = xs.to_vec();
-    v.sort_by(|a, b| a.total_cmp(b));
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        let a = v[n / 2 - 1];
-        let b = v[n / 2];
-        (a + b) * 0.5
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ulcms_mean_f64(ptr: *const c_double, len: usize, out: *mut c_double) -> c_int {
-    if ptr.is_null() || out.is_null() {
-        return 1;
-    }
-    if len == 0 {
-        return 3;
-    }
-    let res = catch_unwind(AssertUnwindSafe(|| {
-        let xs = unsafe { core::slice::from_raw_parts(ptr, len) };
-        mean(xs)
-    }));
-    match res {
-        Ok(m) => {
-            unsafe {
-                *out = m;
-            }
-            0
-        }
-        Err(_) => 2,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ulcms_mean_f64_r(
-    ptr: *const c_double,
-    len_ptr: *const c_int,
-    out: *mut c_double,
-) -> c_int {
-    if ptr.is_null() || out.is_null() || len_ptr.is_null() {
-        return 1;
-    }
-    let len = unsafe { *len_ptr } as usize;
-    ulcms_mean_f64(ptr, len, out)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ulcms_std_f64(ptr: *const c_double, len: usize, out: *mut c_double) -> c_int {
-    if ptr.is_null() || out.is_null() {
-        return 1;
-    }
-    if len == 0 {
-        return 3;
-    }
-    let res = catch_unwind(AssertUnwindSafe(|| {
-        let xs = unsafe { core::slice::from_raw_parts(ptr, len) };
-        std(xs)
-    }));
-    match res {
-        Ok(s) => {
-            unsafe {
-                *out = s;
-            }
-            0
-        }
-        Err(_) => 2,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ulcms_std_f64_r(
-    ptr: *const c_double,
-    len_ptr: *const c_int,
-    out: *mut c_double,
-) -> c_int {
-    if ptr.is_null() || out.is_null() || len_ptr.is_null() {
-        return 1;
-    }
-    let len = unsafe { *len_ptr } as usize;
-    ulcms_std_f64(ptr, len, out)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ulcms_median_f64(ptr: *const c_double, len: usize, out: *mut c_double) -> c_int {
-    if ptr.is_null() || out.is_null() {
-        return 1;
-    }
-    if len == 0 {
-        return 3;
-    }
-    let res = catch_unwind(AssertUnwindSafe(|| {
-        let xs = unsafe { core::slice::from_raw_parts(ptr, len) };
-        median(xs)
-    }));
-    match res {
-        Ok(med) => {
-            unsafe {
-                *out = med;
-            }
-            0
-        }
-        Err(_) => 2,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ulcms_median_f64_r(
-    ptr: *const c_double,
-    len_ptr: *const c_int,
-    out: *mut c_double,
-) -> c_int {
-    if ptr.is_null() || out.is_null() || len_ptr.is_null() {
-        return 1;
-    }
-    let len = unsafe { *len_ptr } as usize;
-    ulcms_median_f64(ptr, len, out)
-}
 
 #[repr(C)]
 pub struct SpectrumSummaryFFI {
@@ -226,8 +88,9 @@ pub extern "C" fn ulcms_parse_mzml(
     let res = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
         let cstr = unsafe { CStr::from_ptr(path) };
         let path_str = cstr.to_str().map_err(|_| "invalid UTF-8".to_string())?;
+        let data = fs::read(path_str).map_err(|e| format!("open/read: {e}"))?;
 
-        let spectra = parse_mzml(path_str)?; // Vec<SpectrumSummary>
+        let spectra = parse_mzml(&data)?;
 
         let buf: Box<[SpectrumSummaryFFI]> = spectra
             .into_iter()
@@ -247,7 +110,45 @@ pub extern "C" fn ulcms_parse_mzml(
 
     match res {
         Ok(Ok(())) => 0,
-        Ok(Err(_msg)) => 4,
+        Ok(Err(_)) => 4,
+        Err(_) => 2,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ulcms_parse_mzml_from_bytes(
+    data_ptr: *const u8,
+    data_len: usize,
+    out_ptr: *mut *mut SpectrumSummaryFFI,
+    out_len: *mut usize,
+) -> c_int {
+    if data_ptr.is_null() || out_ptr.is_null() || out_len.is_null() {
+        return 1;
+    }
+
+    let res = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+        let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+        let spectra = parse_mzml(data)?;
+
+        let buf: Box<[SpectrumSummaryFFI]> = spectra
+            .into_iter()
+            .map(SpectrumSummaryFFI::from)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        let len = buf.len();
+        let ptr = Box::into_raw(buf) as *mut SpectrumSummaryFFI;
+
+        unsafe {
+            *out_ptr = ptr;
+            *out_len = len;
+        }
+        Ok(())
+    }));
+
+    match res {
+        Ok(Ok(())) => 0,
+        Ok(Err(_)) => 4,
         Err(_) => 2,
     }
 }
@@ -296,26 +197,5 @@ pub extern "C" fn ulcms_free_spectra(ptr: *mut SpectrumSummaryFFI, len: usize) {
         }
 
         let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len));
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ulcms_alloc(size: usize) -> *mut u8 {
-    if size == 0 {
-        return core::ptr::null_mut();
-    }
-    let mut v: Vec<u8> = Vec::with_capacity(size);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn ulcms_free(ptr: *mut u8, size: usize) {
-    if ptr.is_null() || size == 0 {
-        return;
-    }
-    unsafe {
-        let _ = Vec::from_raw_parts(ptr, 0, size);
     }
 }
